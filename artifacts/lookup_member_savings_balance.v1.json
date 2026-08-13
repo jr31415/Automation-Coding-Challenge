@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.0",
+  "id": "67be23cd-0e66-43b7-b8fd-d78146524dfa",
+  "name": "lookup_member_savings_balance",
+  "version": 1,
+  "description": "Recorded from discovery goal: \"look up member 12345 and read their current savings balance\"",
+  "app_target": {
+    "vendor_product": "riverbend-core-admin",
+    "base_url": "http://localhost:4000",
+    "min_version": null,
+    "max_version": null
+  },
+  "inputs": [
+    {
+      "name": "value",
+      "type": "string",
+      "required": true,
+      "description": "Value typed during discovery: \"12345\".",
+      "sensitive": false
+    }
+  ],
+  "outputs": [
+    {
+      "name": "savingsBalance",
+      "type": "string",
+      "description": "Value extracted for \"savingsBalance\"."
+    }
+  ],
+  "steps": [
+    {
+      "id": "step-0",
+      "description": "Type a value into a field",
+      "action": {
+        "type": "type",
+        "target": {
+          "strategies": [
+            {
+              "kind": "structural",
+              "tag": "textbox",
+              "nth": 0,
+              "within_container_text": null
+            }
+          ],
+          "reasoning": "Primary: no accessible name was available for this \"textbox\" element at recording time (likely an unlabeled input), so this falls back to structural position immediately -- the least robust strategy. Recommend adding a label or aria-label to this control."
+        },
+        "value": "{{value}}",
+        "sensitive": false
+      },
+      "post_condition": null
+    },
+    {
+      "id": "step-1",
+      "description": "Click element (ref f2e12 at recording time)",
+      "action": {
+        "type": "click",
+        "target": {
+          "strategies": [
+            {
+              "kind": "role",
+              "role": "button",
+              "accessible_name": "Look Up"
+            },
+            {
+              "kind": "text",
+              "text": "Look Up",
+              "exact": true
+            }
+          ],
+          "reasoning": "Primary: role \"button\" with accessible name \"Look Up\", read directly off the element. Fallback: exact visible text match, in case the role changes but the label doesn't."
+        }
+      },
+      "post_condition": null
+    },
+    {
+      "id": "step-2",
+      "description": "Extract the value for \"savingsBalance\"",
+      "action": {
+        "type": "extract",
+        "target": {
+          "strategies": [
+            {
+              "kind": "labelFor",
+              "label": "Savings Balance"
+            },
+            {
+              "kind": "structural",
+              "tag": "cell",
+              "nth": 0,
+              "within_container_text": "Savings Balance"
+            }
+          ],
+          "reasoning": "Primary: the cell's own text (\"$4823.11\") is record data that will differ on every replay, so this locates by the adjacent label cell (\"Savings Balance\") instead -- the stable part of a label/value table row. Fallback: structural position within the row identified by that same label."
+        },
+        "output_key": "savingsBalance"
+      },
+      "post_condition": null
+    }
+  ],
+  "success_condition": {
+    "kind": "urlMatches",
+    "pattern": "/members/12345$"
+  },
+  "known_outcomes": [],
+  "risk_level": "safe",
+  "discovered_at": "2026-08-13T19:25:54.519056Z",
+  "discovered_from_goal": "look up member 12345 and read their current savings balance",
+  "approval_state": "draft"
+}

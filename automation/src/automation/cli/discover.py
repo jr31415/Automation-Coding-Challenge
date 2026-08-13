@@ -23,11 +23,14 @@ from playwright.sync_api import sync_playwright
 
 from automation.agent.browser import BrowserSession
 from automation.agent.loop import DEFAULT_MAX_STEPS, DEFAULT_TIMEOUT_SECONDS, RunResult, SdkAnthropicClient, run_discovery
+from automation.artifact.recorder import RecordingError, record_artifact
+from automation.artifact.schema import AppTarget, RiskLevel
 
 DEFAULT_TARGET = "http://localhost:4000/members/search"
 # src/automation/cli/discover.py -> cli -> automation(pkg) -> src -> automation(project dir) -> repo root
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_EVIDENCE_ROOT = REPO_ROOT / "evidence" / "runs"
+DEFAULT_ARTIFACTS_DIR = REPO_ROOT / "artifacts"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -47,6 +50,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Directory to write this run's evidence into (default: evidence/runs/<timestamp>-<goal-slug>/).",
+    )
+    parser.add_argument(
+        "--capability-name",
+        default=None,
+        help="Name to save the artifact under on success (default: a slug of --goal).",
+    )
+    parser.add_argument(
+        "--risk-level",
+        choices=[r.value for r in RiskLevel],
+        default=RiskLevel.SAFE.value,
+        help="Risk classification recorded on the artifact (default: safe). See automation.policy for how replay uses this.",
+    )
+    parser.add_argument(
+        "--vendor-product",
+        default="riverbend-core-admin",
+        help="App target identifier the artifact is recorded against (default: riverbend-core-admin, the mock app).",
+    )
+    parser.add_argument(
+        "--no-save-artifact",
+        action="store_true",
+        help="Don't save an artifact even if the run completes successfully (evidence is still written).",
     )
     return parser.parse_args(argv)
 
@@ -124,6 +148,50 @@ def _write_evidence(evidence_dir: Path, goal: str, target: str, result: RunResul
         (evidence_dir / "final.png").write_bytes(final_screenshot)
 
 
+def _next_version(artifacts_dir: Path, name: str) -> int:
+    """Existing artifact files are named <name>.v<version>.json; find the
+    highest existing version for this name and return the next one.
+    """
+    existing = list(artifacts_dir.glob(f"{name}.v*.json"))
+    versions = []
+    for path in existing:
+        match = re.match(rf"^{re.escape(name)}\.v(\d+)\.json$", path.name)
+        if match:
+            versions.append(int(match.group(1)))
+    return max(versions, default=0) + 1
+
+
+def _save_artifact(
+    *,
+    artifacts_dir: Path,
+    goal: str,
+    result: RunResult,
+    capability_name: str | None,
+    risk_level: str,
+    vendor_product: str,
+    target: str,
+) -> Path:
+    name = capability_name or _slugify(goal)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    version = _next_version(artifacts_dir, name)
+
+    from urllib.parse import urlparse
+
+    base_url = f"{urlparse(target).scheme}://{urlparse(target).netloc}"
+    artifact = record_artifact(
+        goal=goal,
+        run=result,
+        name=name,
+        app_target=AppTarget(vendor_product=vendor_product, base_url=base_url),
+        risk_level=RiskLevel(risk_level),
+    )
+    artifact = artifact.model_copy(update={"version": version})
+
+    path = artifacts_dir / f"{name}.v{version}.json"
+    path.write_text(artifact.model_dump_json(indent=2))
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv(REPO_ROOT / ".env")
     args = parse_args(sys.argv[1:] if argv is None else argv)
@@ -175,6 +243,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Stuck reason:  {result.stuck_reason}")
         print(f"Stuck details: {result.stuck_details}")
     print(f"Evidence written to: {evidence_dir}")
+
+    if result.stop_reason.value == "done" and not args.no_save_artifact:
+        try:
+            artifact_path = _save_artifact(
+                artifacts_dir=DEFAULT_ARTIFACTS_DIR,
+                goal=args.goal,
+                result=result,
+                capability_name=args.capability_name,
+                risk_level=args.risk_level,
+                vendor_product=args.vendor_product,
+                target=args.target,
+            )
+            print(f"Artifact saved to: {artifact_path}")
+        except RecordingError as e:
+            print(f"Could not record an artifact from this run: {e}")
 
     return 0 if result.stop_reason.value == "done" else 1
 
