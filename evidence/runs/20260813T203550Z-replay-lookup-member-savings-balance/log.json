@@ -1,0 +1,18 @@
+{
+  "artifact": {
+    "name": "lookup_member_savings_balance",
+    "version": 1,
+    "id": "86647e53-1310-4140-b5a1-06a2534a841e"
+  },
+  "inputs": {
+    "value": "12345"
+  },
+  "result": {
+    "kind": "failure",
+    "failureKind": "policy_blocked",
+    "stepId": null,
+    "expected": "a safe/sensitive artifact, or a risky artifact that is approved (or explicitly overridden)",
+    "observed": "Artifact \"lookup_member_savings_balance\" v1 is classified risky and not yet approved -- unattended replay is refused. Pass allow_unapproved=True to override, or set the artifact's approval_state to \"approved\" after human review.",
+    "detail": ""
+  }
+}

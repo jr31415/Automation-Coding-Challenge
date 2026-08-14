@@ -1,0 +1,17 @@
+{
+  "artifact": {
+    "name": "lookup_member_savings_balance",
+    "version": 1,
+    "id": "86647e53-1310-4140-b5a1-06a2534a841e"
+  },
+  "inputs": {
+    "value": "12345"
+  },
+  "result": {
+    "kind": "success",
+    "outputs": {
+      "savingsBalance": "$4823.11"
+    },
+    "stepsCompleted": 3
+  }
+}

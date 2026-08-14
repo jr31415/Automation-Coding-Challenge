@@ -1,0 +1,18 @@
+{
+  "artifact": {
+    "name": "lookup_member_savings_balance",
+    "version": 1,
+    "id": "86647e53-1310-4140-b5a1-06a2534a841e"
+  },
+  "inputs": {
+    "value": "99999"
+  },
+  "result": {
+    "kind": "failure",
+    "failureKind": "locator_not_found",
+    "stepId": "step-2",
+    "expected": "exactly one element to resolve for step step-2",
+    "observed": "attempt 1: [0] labelFor=\"Savings Balance\": no candidate produced; [1] structural tag=\"td\" nth=0: no candidate produced | attempt 2: [0] labelFor=\"Savings Balance\": no candidate produced; [1] structural tag=\"td\" nth=0: no candidate produced | attempt 3: [0] labelFor=\"Savings Balance\": no candidate produced; [1] structural tag=\"td\" nth=0: no candidate produced | attempt 4: [0] labelFor=\"Savings Balance\": no candidate produced; [1] structural tag=\"td\" nth=0: no candidate produced",
+    "detail": ""
+  }
+}
