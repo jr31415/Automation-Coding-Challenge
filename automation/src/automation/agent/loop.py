@@ -30,6 +30,7 @@ from typing import Any, Protocol
 from automation.agent.browser import BrowserSession, Snapshot
 from automation.agent.executor import EXECUTABLE_TOOLS, ToolResult, execute
 from automation.agent.tools import AGENT_TOOLS, anthropic_tool_definitions
+from automation.policy.allowlist import Allowlist
 
 DEFAULT_MAX_STEPS = 25
 DEFAULT_TIMEOUT_SECONDS = 180.0
@@ -190,6 +191,7 @@ def run_discovery(
     client: AnthropicClient,
     max_steps: int = DEFAULT_MAX_STEPS,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    allowlist: Allowlist | None = None,
 ) -> RunResult:
     """Run the observe-decide-act loop until `done`, `stuck`, or a stopping
     condition (max_steps / timeout_seconds) is hit.
@@ -253,7 +255,7 @@ def run_discovery(
             raise GoalUnreachableError(f'Model called unknown tool "{tool_name}".')
 
         parsed_input = AGENT_TOOLS[tool_name].schema_.model_validate(raw_input)
-        result = execute(session, snapshot, tool_name, parsed_input)
+        result = execute(session, snapshot, tool_name, parsed_input, allowlist=allowlist)
         steps.append(StepRecord(step_index, snapshot, tool_name, raw_input, result))
         messages.append(_tool_result_to_user_message(tool_use.id, result))
 

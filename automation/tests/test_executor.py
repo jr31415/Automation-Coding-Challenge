@@ -353,3 +353,96 @@ def test_stuck_is_rejected_by_executor(page: Page):
 
 def test_default_action_timeout_is_positive():
     assert DEFAULT_ACTION_TIMEOUT_MS > 0
+
+
+# ---------------------------------------------------------------------------
+# allowlist enforcement
+# ---------------------------------------------------------------------------
+
+
+def _allowlist_permitting(*action_types, domain="localhost", path_patterns=("*",)):
+    from automation.policy.allowlist import Allowlist, AllowlistEntry
+
+    return Allowlist(
+        entries=(AllowlistEntry(domain=domain, path_patterns=path_patterns),),
+        allowed_action_types=frozenset(action_types),
+    )
+
+
+def test_navigate_blocked_when_action_type_not_allowed(page: Page):
+    sess = BrowserSession(page)
+    snap = sess.snapshot()
+    al = _allowlist_permitting("click")  # navigate not included
+    result = execute(sess, snap, "navigate", NavigateInput(url="data:text/html,<html></html>"), allowlist=al)
+    assert result.ok is False
+    assert "Blocked by allowlist" in result.error
+
+
+def test_navigate_blocked_when_destination_domain_not_allowlisted(page: Page):
+    sess = BrowserSession(page)
+    snap = sess.snapshot()
+    al = _allowlist_permitting("navigate", domain="localhost:4000")
+    result = execute(sess, snap, "navigate", NavigateInput(url="http://evil.example.com/x"), allowlist=al)
+    assert result.ok is False
+    assert "Blocked by allowlist" in result.error
+
+
+def test_navigate_allowed_when_destination_matches_allowlist(page: Page):
+    _load(page, "<html><body>x</body></html>")
+    sess = BrowserSession(page)
+    snap = sess.snapshot()
+    al = _allowlist_permitting("navigate", domain="localhost:4000", path_patterns=("/members/*",))
+    result = execute(sess, snap, "navigate", NavigateInput(url="http://localhost:4000/members/12345"), allowlist=al)
+    assert result.ok is True
+
+
+def test_navigate_never_attempted_when_blocked_by_allowlist(page: Page):
+    # The browser must not even be told to go there -- confirm the page URL
+    # is unchanged after a blocked navigate, not just that the result says ok=False.
+    page.goto("data:text/html,<html><body>start</body></html>")
+    start_url = page.url
+    sess = BrowserSession(page)
+    snap = sess.snapshot()
+    al = _allowlist_permitting("navigate", domain="localhost:4000")
+    execute(sess, snap, "navigate", NavigateInput(url="http://evil.example.com/x"), allowlist=al)
+    assert page.url == start_url
+
+
+def test_click_blocked_when_action_type_not_allowed(page: Page):
+    _load(page, "<html><body><button>Go</button></body></html>")
+    sess = BrowserSession(page)
+    snap = sess.snapshot()
+    ref = _ref_for(sess, snap, "BUTTON")
+    al = _allowlist_permitting("navigate")  # click not included
+    result = execute(sess, snap, "click", ClickInput(ref=ref), allowlist=al)
+    assert result.ok is False
+    assert "Blocked by allowlist" in result.error
+
+
+def test_no_allowlist_means_no_enforcement(page: Page):
+    # Backward-compatible default: omitting allowlist entirely (None) means
+    # unrestricted, matching every pre-existing call site and test that
+    # doesn't know about policy at all.
+    _load(page, "<html><body><button>Go</button></body></html>")
+    sess = BrowserSession(page)
+    snap = sess.snapshot()
+    ref = _ref_for(sess, snap, "BUTTON")
+    result = execute(sess, snap, "click", ClickInput(ref=ref))
+    assert result.ok is True
+
+
+def test_click_that_navigates_off_allowlist_is_blocked_after_the_fact(page: Page):
+    # A click can trigger navigation just like an explicit navigate call --
+    # the allowlist must catch this even though the *action type* (click)
+    # was itself permitted.
+    _load(page, '<html><body><a href="http://evil.example.com/steal">Click me</a></body></html>')
+    sess = BrowserSession(page)
+    snap = sess.snapshot()
+    ref = None
+    for r in snap.refs:
+        if sess.resolve(r, snap).evaluate("el => el.tagName") == "A":
+            ref = r
+    al = _allowlist_permitting("click", domain="localhost:4000")
+    result = execute(sess, snap, "click", ClickInput(ref=ref), allowlist=al)
+    assert result.ok is False
+    assert "outside permitted scope" in result.error

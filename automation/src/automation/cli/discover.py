@@ -25,6 +25,9 @@ from automation.agent.browser import BrowserSession
 from automation.agent.loop import DEFAULT_MAX_STEPS, DEFAULT_TIMEOUT_SECONDS, RunResult, SdkAnthropicClient, run_discovery
 from automation.artifact.recorder import RecordingError, record_artifact
 from automation.artifact.schema import AppTarget, RiskLevel
+from automation.escalation.handoff import build_handoff_result, build_intervention_request, format_intervention_summary
+from automation.policy.allowlist import Allowlist, AllowlistEntry
+from automation.policy.redact import REDACTED, redact_mapping
 
 DEFAULT_TARGET = "http://localhost:4000/members/search"
 # src/automation/cli/discover.py -> cli -> automation(pkg) -> src -> automation(project dir) -> repo root
@@ -44,7 +47,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--password", default="discovery-agent", help="Password to log in with.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
-    parser.add_argument("--headed", action="store_true", help="Run the browser with a visible window.")
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        default=True,
+        help="Run the browser with a visible window (default: on). A headed session with an open CDP "
+        "debugging port is what makes real human handoff possible if the agent gets stuck -- see "
+        "automation.escalation.handoff.",
+    )
+    parser.add_argument(
+        "--headless",
+        dest="headed",
+        action="store_false",
+        help="Run headless instead. If the agent then calls `stuck`, escalation is reported but there is "
+        "no live window a human could actually take control of -- the run is treated as unresolved.",
+    )
+    parser.add_argument(
+        "--cdp-port",
+        type=int,
+        default=9222,
+        help="Chromium remote-debugging port to expose for the handoff mechanism (default: 9222).",
+    )
+    parser.add_argument(
+        "--no-interactive-escalation",
+        action="store_true",
+        help="If the agent calls `stuck`, don't block on a terminal prompt for a human operator -- report "
+        "the intervention request and exit immediately. Useful for CI or scripted runs.",
+    )
     parser.add_argument(
         "--evidence-dir",
         type=Path,
@@ -72,7 +101,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Don't save an artifact even if the run completes successfully (evidence is still written).",
     )
+    parser.add_argument(
+        "--allowed-path",
+        action="append",
+        default=[],
+        dest="allowed_paths",
+        metavar="PATTERN",
+        help="An fnmatch-style path pattern the agent may navigate to on --target's domain, e.g. '/members/*'. "
+        "Repeatable. If omitted, defaults to the target's own path plus '/login' and '/members/*' "
+        "(the mock app's real routes).",
+    )
+    parser.add_argument(
+        "--no-allowlist",
+        action="store_true",
+        help="Disable allowlist enforcement entirely (not recommended -- see automation.policy.allowlist).",
+    )
     return parser.parse_args(argv)
+
+
+def _build_allowlist(target: str, allowed_paths: list[str]) -> Allowlist:
+    from urllib.parse import urlparse
+
+    domain = urlparse(target).netloc
+    patterns = tuple(allowed_paths) if allowed_paths else ("/login", "/members/*")
+    return Allowlist(
+        entries=(AllowlistEntry(domain=domain, path_patterns=patterns),),
+        allowed_action_types=frozenset({"navigate", "click", "type", "select", "wait_for", "extract"}),
+    )
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
@@ -110,11 +165,18 @@ def _login(session: BrowserSession, base_url: str, username: str, password: str)
 
 
 def _step_record_to_dict(record) -> dict:
+    # The model's raw tool_input for a `type(..., sensitive=True)` call
+    # still carries the literal secret value -- the executor only redacts
+    # its own ToolResult.data, not the input that produced it. Redact here
+    # too, since this is the dict that gets serialized to disk.
+    tool_input = record.tool_input
+    if record.tool_name == "type" and isinstance(tool_input, dict) and tool_input.get("sensitive"):
+        tool_input = {**tool_input, "value": REDACTED}
     return {
         "index": record.index,
         "url": record.snapshot.url,
         "tool_name": record.tool_name,
-        "tool_input": record.tool_input,
+        "tool_input": tool_input,
         "result": (
             {
                 "ok": record.result.ok,
@@ -127,7 +189,37 @@ def _step_record_to_dict(record) -> dict:
     }
 
 
-def _write_evidence(evidence_dir: Path, goal: str, target: str, result: RunResult, final_screenshot: bytes | None) -> None:
+def _handoff_record_to_dict(handoff_record: dict) -> dict:
+    request = handoff_record["request"]
+    handoff = handoff_record["handoff"]
+    return {
+        "intervention": {
+            "goal": request.goal,
+            "reason": request.reason,
+            "details": request.details,
+            "currentUrl": request.current_url,
+            "stepsCompleted": request.steps_completed,
+            "screenshotPath": request.screenshot_path,
+            "requestedAt": request.requested_at.isoformat(),
+            "sessionEndpoint": request.session_endpoint,
+        },
+        "handoff": {
+            "resumed": handoff.resumed,
+            "operatorNotes": handoff.operator_notes,
+            "actionsTaken": handoff.actions_taken,
+            "handledAt": handoff.handled_at.isoformat() if handoff.handled_at else None,
+        },
+    }
+
+
+def _write_evidence(
+    evidence_dir: Path,
+    goal: str,
+    target: str,
+    result: RunResult,
+    final_screenshot: bytes | None,
+    handoff_record: dict | None = None,
+) -> None:
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
     log = {
@@ -141,11 +233,95 @@ def _write_evidence(evidence_dir: Path, goal: str, target: str, result: RunResul
         "stuckReason": result.stuck_reason,
         "stuckDetails": result.stuck_details,
         "steps": [_step_record_to_dict(s) for s in result.steps],
+        "escalation": _handoff_record_to_dict(handoff_record) if handoff_record is not None else None,
     }
+    # Shape-based backstop over the whole log, in case a secret leaked into
+    # some other field (e.g. echoed into `outputs` or `summary`) that the
+    # name-based check above doesn't cover.
+    log = redact_mapping(log)
     (evidence_dir / "log.json").write_text(json.dumps(log, indent=2))
 
     if final_screenshot is not None:
         (evidence_dir / "final.png").write_bytes(final_screenshot)
+
+
+def _cdp_endpoint(cdp_port: int) -> str:
+    import urllib.request
+
+    with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/version", timeout=5) as resp:
+        info = json.loads(resp.read())
+    return info["webSocketDebuggerUrl"]
+
+
+def _handle_escalation(
+    *,
+    goal: str,
+    result: RunResult,
+    page,
+    evidence_dir: Path,
+    cdp_port: int,
+    headed: bool,
+    interactive: bool,
+) -> tuple[RunResult, dict]:
+    """When `stuck` fires: build the intervention request, expose the live
+    session, and (if interactive) block on a terminal prompt for a human
+    operator to signal what happened. Returns the (possibly unchanged)
+    RunResult plus a handoff record to fold into evidence.
+
+    Whether the run can actually resume automated execution afterward is
+    out of scope for this demo (see REPORT.md "Cuts") -- what this proves
+    is the real part of the requirement: detect stuck, carry context to a
+    human, expose the literal live session (not a fresh one) for them to
+    act on directly, and record what they did before handing back.
+    """
+    screenshot_path = evidence_dir / "stuck.png"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(screenshot_path))
+
+    cdp_endpoint = _cdp_endpoint(cdp_port) if headed else f"http://127.0.0.1:{cdp_port} (headless -- no visible window)"
+
+    request = build_intervention_request(
+        goal=goal,
+        run_result=result,
+        current_url=page.url,
+        screenshot_path=str(screenshot_path),
+        cdp_endpoint=cdp_endpoint,
+    )
+    print()
+    print(format_intervention_summary(request))
+
+    if not headed:
+        print()
+        print("This run was headless -- there is no visible window for a human to take control of.")
+        print("Re-launch with --headed (the default) to make live handoff possible.")
+        handoff = build_handoff_result(resumed=False, operator_notes="headless run, no live handoff possible", actions_taken=[])
+        return result, {"request": request, "handoff": handoff}
+
+    if not interactive:
+        print()
+        print("--no-interactive-escalation set: reporting the intervention and exiting without blocking.")
+        handoff = build_handoff_result(resumed=False, operator_notes="non-interactive mode", actions_taken=[])
+        return result, {"request": request, "handoff": handoff}
+
+    print()
+    print("The automation is now PAUSED and will not touch the page while you have control.")
+    actions_taken: list[str] = []
+    while True:
+        line = input("Operator action taken (blank to finish, or 'abort'): ").strip()
+        if not line:
+            break
+        if line.lower() == "abort":
+            actions_taken = []
+            break
+        actions_taken.append(line)
+
+    resumed_input = input("Resume the automated run now that you're done? [y/N]: ").strip().lower()
+    resumed = resumed_input == "y"
+    notes = input("Any notes for the record? ").strip()
+
+    handoff = build_handoff_result(resumed=resumed, operator_notes=notes, actions_taken=actions_taken)
+    print(f"Control returned to automation. resumed={resumed}")
+    return result, {"request": request, "handoff": handoff}
 
 
 def _next_version(artifacts_dir: Path, name: str) -> int:
@@ -206,8 +382,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Evidence will be written to: {evidence_dir}")
     print()
 
+    launch_args = [f"--remote-debugging-port={args.cdp_port}"] if args.headed else []
+    handoff_record: dict | None = None
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not args.headed)
+        browser = p.chromium.launch(headless=not args.headed, args=launch_args)
         page = browser.new_page()
         session = BrowserSession(page)
 
@@ -217,6 +396,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Navigating to target: {args.target}")
         page.goto(args.target)
 
+        allowlist = None if args.no_allowlist else _build_allowlist(args.target, args.allowed_paths)
+
         print("Starting discovery loop...")
         client = SdkAnthropicClient()
         result = run_discovery(
@@ -225,12 +406,27 @@ def main(argv: list[str] | None = None) -> int:
             client=client,
             max_steps=args.max_steps,
             timeout_seconds=args.timeout_seconds,
+            allowlist=allowlist,
         )
+
+        if result.stop_reason.value == "stuck":
+            # The browser is deliberately left open (not closed) here so the
+            # human operator can attach to the exact same live session --
+            # closing it before handoff would defeat the whole point.
+            result, handoff_record = _handle_escalation(
+                goal=args.goal,
+                result=result,
+                page=page,
+                evidence_dir=evidence_dir,
+                cdp_port=args.cdp_port,
+                headed=args.headed,
+                interactive=not args.no_interactive_escalation,
+            )
 
         final_screenshot = page.screenshot()
         browser.close()
 
-    _write_evidence(evidence_dir, args.goal, args.target, result, final_screenshot)
+    _write_evidence(evidence_dir, args.goal, args.target, result, final_screenshot, handoff_record)
 
     print()
     print(f"Stop reason: {result.stop_reason.value}")

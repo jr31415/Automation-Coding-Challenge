@@ -50,6 +50,33 @@ _TREE_LINE_RE = re.compile(
     r'^\s*-\s*(?P<role>[a-zA-Z]+)(?:\s+"(?P<name>[^"]*)")?[^\[]*\[ref=(?P<ref>[^\]]+)\]'
 )
 
+# StructuralLocator.tag must be a real HTML tag Playwright can use as a CSS
+# selector (page.locator(tag)), not an ARIA role -- the accessibility
+# snapshot only gives us the role (e.g. "textbox"), so this maps the
+# standard, spec-defined ARIA roles for form controls back to the HTML tag
+# that produces them (per the HTML-AAM spec). Recording never has live DOM
+# access (see design discussion: keeping the recorder a pure function of a
+# RunResult, not requiring an open browser session), so this static table is
+# the deliberate trade-off -- it covers every role this system's flows
+# actually produce; an unmapped role falls back to using the role name
+# itself as a last resort (better than nothing, but flagged in reasoning).
+_ROLE_TO_HTML_TAG = {
+    "textbox": "input",
+    "searchbox": "input",
+    "combobox": "select",
+    "checkbox": "input",
+    "radio": "input",
+    "button": "button",
+    "link": "a",
+    "cell": "td",
+    "columnheader": "th",
+    "rowheader": "th",
+    "row": "tr",
+    "table": "table",
+    "heading": "h1, h2, h3, h4, h5, h6",
+    "paragraph": "p",
+}
+
 
 class RecordingError(Exception):
     """Raised when a run cannot be translated into an artifact."""
@@ -126,8 +153,13 @@ def _locator_for_ref(tree_text: str, ref: str) -> TargetLocator:
                 f'every replay, so this locates by the adjacent label cell ("{label}") instead -- the stable '
                 "part of a label/value table row."
             )
-            strategies.append(StructuralLocator(tag="cell", nth=0, within_container_text=label))
-            reasoning_parts.append("Fallback: structural position within the row identified by that same label.")
+            # nth=1, not 0: within the row scoped by the label text, index 0
+            # is the label cell itself ("Savings Balance") -- the value
+            # we actually want is the next cell over.
+            strategies.append(StructuralLocator(tag="td", nth=1, within_container_text=label))
+            reasoning_parts.append(
+                "Fallback: structural position (second cell) within the row identified by that same label."
+            )
             return TargetLocator(strategies=strategies, reasoning=" ".join(reasoning_parts))
         # No sibling label found -- fall through to the generic name-based
         # strategy below, but the reasoning should flag the risk.
@@ -149,12 +181,18 @@ def _locator_for_ref(tree_text: str, ref: str) -> TargetLocator:
         # Role alone is rarely unique, so lead with structural position
         # among same-role, same-ref-context elements, using ref order as a
         # stable-enough proxy for DOM order within this run.
-        strategies.append(StructuralLocator(tag=role, nth=0))
+        html_tag = _ROLE_TO_HTML_TAG.get(role, role)
+        strategies.append(StructuralLocator(tag=html_tag, nth=0))
         reasoning_parts.append(
             f'Primary: no accessible name was available for this "{role}" element at recording time '
             "(likely an unlabeled input), so this falls back to structural position immediately -- "
             "the least robust strategy. Recommend adding a label or aria-label to this control."
         )
+        if html_tag == role and role not in _ROLE_TO_HTML_TAG:
+            reasoning_parts.append(
+                f'Note: role "{role}" has no known HTML-tag mapping, so the role name itself was used as the '
+                "tag selector -- verify this resolves correctly."
+            )
     else:
         strategies.append(StructuralLocator(tag="*", nth=0))
         reasoning_parts.append(f"Could not parse the snapshot line for ref {ref!r}; recorded as an unstructured fallback.")
@@ -167,6 +205,41 @@ def _url_path(url: str) -> str:
     return parsed.path or "/"
 
 
+def _templated_url_pattern(path: str, namer: "_ParamNamer") -> str:
+    """Build a regex pattern for the success_condition by substituting any
+    literal values that were typed as inputs during this run (e.g. a member
+    id) with their {{param}} placeholder wherever they appear in the final
+    URL path -- e.g. "/members/12345" with memberId="12345" becomes
+    "/members/\\{\\{memberId\\}\\}$" -> rendered at replay time via the same
+    _render_template the engine already uses for step values.
+
+    Without this, a success_condition recorded from one run's specific
+    input (e.g. member 12345) would never match a replay with a different
+    input (e.g. member 67890), even though the flow correctly reached that
+    member's equivalent page -- the checkpoint would over-fit to the
+    exact value seen during discovery instead of asserting the *shape* of
+    a correct end state.
+    """
+    # Substitute longest values first so a shorter value that happens to be
+    # a substring of a longer one (e.g. "123" inside "12345") doesn't
+    # corrupt the longer substitution.
+    for value, param_name in sorted(namer.value_to_name.items(), key=lambda kv: -len(kv[0])):
+        if value and value in path:
+            path = path.replace(value, f"{{{{{param_name}}}}}")
+    return _escape_outside_templates(path) + "$"
+
+
+def _escape_outside_templates(path: str) -> str:
+    """re.escape the literal parts of a path that still contains {{param}}
+    placeholders, without escaping the placeholders' braces themselves --
+    they need to survive as literal "{{name}}" text for _render_template
+    (used by the replay engine) to substitute later, and must not be
+    treated as regex syntax before that substitution happens.
+    """
+    parts = re.split(r"(\{\{\w+\}\})", path)
+    return "".join(part if re.fullmatch(r"\{\{\w+\}\}", part) else re.escape(part) for part in parts)
+
+
 class _ParamNamer:
     """Assigns stable {{paramName}} names to literal values typed during the
     run, reusing the same name if the same literal value is typed more than
@@ -174,12 +247,12 @@ class _ParamNamer:
     """
 
     def __init__(self):
-        self._name_by_value: dict[str, str] = {}
+        self.value_to_name: dict[str, str] = {}
         self._used_names: set[str] = set()
 
     def name_for(self, value: str, hint: str) -> str:
-        if value in self._name_by_value:
-            return self._name_by_value[value]
+        if value in self.value_to_name:
+            return self.value_to_name[value]
         base = re.sub(r"[^a-zA-Z0-9]", "", hint) or "param"
         base = base[0].lower() + base[1:] if base else "param"
         name = base
@@ -188,7 +261,7 @@ class _ParamNamer:
             name = f"{base}{i}"
             i += 1
         self._used_names.add(name)
-        self._name_by_value[value] = name
+        self.value_to_name[value] = name
         return name
 
 
@@ -235,7 +308,7 @@ def record_artifact(
             )
 
     final_url = run.steps[-1].snapshot.url
-    success_condition = UrlMatchesCondition(pattern=re.escape(_url_path(final_url)) + "$")
+    success_condition = UrlMatchesCondition(pattern=_templated_url_pattern(_url_path(final_url), namer))
 
     return Artifact(
         id=str(uuid.uuid4()),

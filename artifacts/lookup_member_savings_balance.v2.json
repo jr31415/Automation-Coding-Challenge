@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0",
-  "id": "86647e53-1310-4140-b5a1-06a2534a841e",
+  "id": "abf65527-c1f8-4051-9c4f-79e9fa750e3d",
   "name": "lookup_member_savings_balance",
-  "version": 1,
+  "version": 2,
   "description": "Recorded from discovery goal: \"look up member 12345 and read their current savings balance\"",
   "app_target": {
     "vendor_product": "riverbend-core-admin",
@@ -85,11 +85,11 @@
             {
               "kind": "structural",
               "tag": "td",
-              "nth": 0,
+              "nth": 1,
               "within_container_text": "Savings Balance"
             }
           ],
-          "reasoning": "Primary: the cell's own text (\"$4823.11\") is record data that will differ on every replay, so this locates by the adjacent label cell (\"Savings Balance\") instead -- the stable part of a label/value table row. Fallback: structural position within the row identified by that same label."
+          "reasoning": "Primary: the cell's own text (\"$4823.11\") is record data that will differ on every replay, so this locates by the adjacent label cell (\"Savings Balance\") instead -- the stable part of a label/value table row. Fallback: structural position (second cell) within the row identified by that same label."
         },
         "output_key": "savingsBalance"
       },
@@ -102,7 +102,7 @@
   },
   "known_outcomes": [],
   "risk_level": "safe",
-  "discovered_at": "2026-08-13T19:46:43.436005Z",
+  "discovered_at": "2026-08-13T21:08:31.515349Z",
   "discovered_from_goal": "look up member 12345 and read their current savings balance",
   "approval_state": "draft"
 }

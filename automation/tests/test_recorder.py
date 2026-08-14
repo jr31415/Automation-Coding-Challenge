@@ -140,7 +140,22 @@ def test_extract_step_becomes_an_output_field():
 def test_success_condition_is_url_match_on_final_page_path():
     artifact = _record(_successful_run())
     assert artifact.success_condition.kind == "urlMatches"
-    assert artifact.success_condition.pattern == r"/members/12345" + "$"
+    # The literal member id typed during this run ("12345") must be
+    # templated back to its {{param}} placeholder -- a success_condition
+    # that hardcoded "/members/12345$" would never match a replay for any
+    # other member, even though the flow reached the equivalent page.
+    assert "{{" in artifact.success_condition.pattern
+    assert "12345" not in artifact.success_condition.pattern
+
+
+def test_success_condition_pattern_renders_correctly_for_the_recorded_input_param():
+    import re
+
+    artifact = _record(_successful_run())
+    param_name = artifact.inputs[0].name
+    rendered = artifact.success_condition.pattern.replace(f"{{{{{param_name}}}}}", "67890")
+    assert re.search(rendered, "http://localhost:4000/members/67890")
+    assert not re.search(rendered, "http://localhost:4000/members/12345/sub-account/new")
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +220,10 @@ def test_unlabeled_textbox_falls_back_to_structural_locator():
     assert type_step.action.type == "type"
     primary = type_step.action.target.strategies[0]
     assert isinstance(primary, StructuralLocator)
-    assert primary.tag == "textbox"
+    # Must be a real HTML tag Playwright can use as a CSS selector, not the
+    # bare ARIA role -- "textbox" is not a valid tag/selector, "input" is
+    # the HTML element that produces that role.
+    assert primary.tag == "input"
 
 
 def test_unlabeled_element_reasoning_flags_the_missing_label():

@@ -18,6 +18,7 @@ from automation.agent.loop import RunResult, StepRecord, StopReason
 from automation.agent.browser import Snapshot
 from automation.cli.discover import (
     DEFAULT_TARGET,
+    _handoff_record_to_dict,
     _slugify,
     _step_record_to_dict,
     _write_evidence,
@@ -58,12 +59,20 @@ def test_max_steps_and_timeout_are_configurable():
     assert args.timeout_seconds == 30.0
 
 
-def test_headed_flag_defaults_false():
+def test_headed_defaults_true():
+    # Headed-by-default is deliberate: a real human handoff (see
+    # automation.escalation.handoff) needs a visible window with an open
+    # CDP port, which only exists for headed runs.
     args = parse_args(["--goal", "g"])
+    assert args.headed is True
+
+
+def test_headless_flag_disables_headed():
+    args = parse_args(["--goal", "g", "--headless"])
     assert args.headed is False
 
 
-def test_headed_flag_can_be_set():
+def test_headed_flag_still_accepted_explicitly():
     args = parse_args(["--goal", "g", "--headed"])
     assert args.headed is True
 
@@ -119,6 +128,36 @@ def test_step_record_with_result_serializes_result_fields():
     assert d["url"] == "http://localhost:4000/members/search"
     assert d["tool_name"] == "click"
     assert d["result"] == {"ok": True, "data": {"ref": "e1"}, "error": None}
+
+
+def test_step_record_redacts_sensitive_typed_value_from_raw_tool_input():
+    # Regression test: the executor already redacts its own ToolResult.data
+    # for a sensitive type() call, but StepRecord.tool_input is the raw
+    # dict straight from the model's tool call and previously still carried
+    # the literal secret -- which would have been written verbatim to
+    # evidence/runs/.../log.json on disk.
+    record = StepRecord(
+        index=0,
+        snapshot=_fake_snapshot(),
+        tool_name="type",
+        tool_input={"ref": "e1", "value": "hunter2", "sensitive": True},
+        result=ToolResult(ok=True, tool="type", data={"ref": "e1", "value": "[REDACTED]"}, error=None),
+    )
+    d = _step_record_to_dict(record)
+    assert d["tool_input"]["value"] == "[REDACTED]"
+    assert "hunter2" not in json.dumps(d)
+
+
+def test_step_record_does_not_redact_non_sensitive_typed_value():
+    record = StepRecord(
+        index=0,
+        snapshot=_fake_snapshot(),
+        tool_name="type",
+        tool_input={"ref": "e1", "value": "12345", "sensitive": False},
+        result=ToolResult(ok=True, tool="type", data={"ref": "e1", "value": "12345"}, error=None),
+    )
+    d = _step_record_to_dict(record)
+    assert d["tool_input"]["value"] == "12345"
 
 
 def test_step_record_without_result_serializes_result_as_none():
@@ -225,3 +264,85 @@ def test_write_evidence_stuck_run_includes_stuck_fields(tmp_path):
     log = json.loads((evidence_dir / "log.json").read_text())
     assert log["stuckReason"] == "permission_denied"
     assert log["stuckDetails"] == "account restricted"
+
+
+def test_write_evidence_never_persists_a_sensitive_typed_value_to_disk(tmp_path):
+    result = RunResult(
+        stop_reason=StopReason.DONE,
+        steps=[
+            StepRecord(
+                index=0,
+                snapshot=_fake_snapshot(),
+                tool_name="type",
+                tool_input={"ref": "e1", "value": "hunter2", "sensitive": True},
+                result=ToolResult(ok=True, tool="type", data={"ref": "e1", "value": "[REDACTED]"}, error=None),
+            )
+        ],
+        outputs={},
+        summary="Logged in.",
+    )
+    evidence_dir = tmp_path / "run-5"
+
+    _write_evidence(evidence_dir, "log in", DEFAULT_TARGET, result, final_screenshot=None)
+
+    raw = (evidence_dir / "log.json").read_text()
+    assert "hunter2" not in raw
+
+
+# ---------------------------------------------------------------------------
+# escalation / handoff evidence
+# ---------------------------------------------------------------------------
+
+
+def _fake_handoff_record():
+    from automation.escalation.handoff import build_handoff_result, build_intervention_request
+
+    run = RunResult(
+        stop_reason=StopReason.STUCK,
+        steps=[],
+        stuck_reason="permission_denied",
+        stuck_details="account restricted",
+    )
+    request = build_intervention_request(
+        goal="open a sub-account",
+        run_result=run,
+        current_url="http://localhost:4000/members/11111",
+        screenshot_path="/tmp/stuck.png",
+        cdp_endpoint="ws://127.0.0.1:9222/devtools/browser/abc",
+    )
+    handoff = build_handoff_result(resumed=True, operator_notes="cleared it manually", actions_taken=["clicked override"])
+    return {"request": request, "handoff": handoff}
+
+
+def test_handoff_record_to_dict_shape():
+    d = _handoff_record_to_dict(_fake_handoff_record())
+    assert d["intervention"]["reason"] == "permission_denied"
+    assert d["intervention"]["currentUrl"] == "http://localhost:4000/members/11111"
+    assert d["handoff"]["resumed"] is True
+    assert d["handoff"]["actionsTaken"] == ["clicked override"]
+
+
+def test_handoff_record_to_dict_is_json_safe():
+    d = _handoff_record_to_dict(_fake_handoff_record())
+    json.dumps(d)  # must not raise
+
+
+def test_write_evidence_includes_escalation_when_provided(tmp_path):
+    result = RunResult(stop_reason=StopReason.STUCK, steps=[], stuck_reason="permission_denied", stuck_details="x")
+    evidence_dir = tmp_path / "run-escalation"
+
+    _write_evidence(evidence_dir, "g", DEFAULT_TARGET, result, final_screenshot=None, handoff_record=_fake_handoff_record())
+
+    log = json.loads((evidence_dir / "log.json").read_text())
+    assert log["escalation"] is not None
+    assert log["escalation"]["handoff"]["resumed"] is True
+
+
+def test_write_evidence_escalation_is_none_when_not_provided(tmp_path):
+    result = RunResult(stop_reason=StopReason.DONE, steps=[], outputs={}, summary="ok")
+    evidence_dir = tmp_path / "run-no-escalation"
+
+    _write_evidence(evidence_dir, "g", DEFAULT_TARGET, result, final_screenshot=None)
+
+    log = json.loads((evidence_dir / "log.json").read_text())
+    assert log["escalation"] is None

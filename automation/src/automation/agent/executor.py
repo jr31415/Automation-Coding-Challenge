@@ -33,6 +33,7 @@ from automation.agent.tools import (
     UrlMatchesWait,
     WaitForInput,
 )
+from automation.policy.allowlist import Allowlist
 
 # Tools the executor actually dispatches. `done` and `stuck` are deliberately
 # excluded -- see module docstring.
@@ -61,9 +62,20 @@ class ToolResult:
     error: str | None = None
 
 
-def execute(session: BrowserSession, snapshot: Snapshot, tool_name: str, tool_input: Any) -> ToolResult:
+def execute(
+    session: BrowserSession,
+    snapshot: Snapshot,
+    tool_name: str,
+    tool_input: Any,
+    allowlist: Allowlist | None = None,
+) -> ToolResult:
     """Dispatch a single validated tool call. `tool_input` must already be
     the parsed pydantic model for `tool_name` (see automation.agent.tools).
+
+    If `allowlist` is given, the action type is checked before dispatch, and
+    for `navigate` the destination URL is checked before the browser is
+    told to go there at all -- an agent must not even attempt a disallowed
+    navigation, not just have its result discarded after the fact.
     """
     if tool_name not in EXECUTABLE_TOOLS:
         return ToolResult(
@@ -73,25 +85,51 @@ def execute(session: BrowserSession, snapshot: Snapshot, tool_name: str, tool_in
             error=f'"{tool_name}" is not an executable browser tool (expected one of {sorted(EXECUTABLE_TOOLS)}).',
         )
 
+    if allowlist is not None:
+        type_allowed, type_reason = allowlist.check_action_type(tool_name)
+        if not type_allowed:
+            return ToolResult(ok=False, tool=tool_name, data={}, error=f"Blocked by allowlist: {type_reason}")
+        if tool_name == "navigate":
+            url_allowed, url_reason = allowlist.check_url(tool_input.url)
+            if not url_allowed:
+                return ToolResult(ok=False, tool=tool_name, data={}, error=f"Blocked by allowlist: {url_reason}")
+
     try:
         if tool_name == "navigate":
-            return _navigate(session, tool_input)
-        if tool_name == "click":
-            return _click(session, snapshot, tool_input)
-        if tool_name == "type":
-            return _type(session, snapshot, tool_input)
-        if tool_name == "select":
-            return _select(session, snapshot, tool_input)
-        if tool_name == "wait_for":
-            return _wait_for(session, snapshot, tool_input)
-        if tool_name == "extract":
-            return _extract(session, snapshot, tool_input)
+            result = _navigate(session, tool_input)
+        elif tool_name == "click":
+            result = _click(session, snapshot, tool_input)
+        elif tool_name == "type":
+            result = _type(session, snapshot, tool_input)
+        elif tool_name == "select":
+            result = _select(session, snapshot, tool_input)
+        elif tool_name == "wait_for":
+            result = _wait_for(session, snapshot, tool_input)
+        elif tool_name == "extract":
+            result = _extract(session, snapshot, tool_input)
     except StaleRefError as e:
         return ToolResult(ok=False, tool=tool_name, data={}, error=str(e))
     except PlaywrightTimeoutError as e:
         return ToolResult(ok=False, tool=tool_name, data={}, error=f"Timed out: {e}")
     except PlaywrightError as e:
         return ToolResult(ok=False, tool=tool_name, data={}, error=f"Browser error: {e}")
+
+    # A click or select can trigger navigation (a link, a form submit) just
+    # as easily as an explicit `navigate` call -- re-check the allowlist
+    # against wherever we actually ended up, not just the URL we started
+    # from, so an in-allowlist page can't be used as a stepping stone off
+    # the allowlist via a click.
+    if allowlist is not None and result.ok and tool_name in ("click", "select"):
+        url_allowed, url_reason = allowlist.check_url(session.page.url)
+        if not url_allowed:
+            return ToolResult(
+                ok=False,
+                tool=tool_name,
+                data=result.data,
+                error=f"Blocked by allowlist after action landed outside permitted scope: {url_reason}",
+            )
+
+    return result
 
     raise AssertionError(f"unreachable: unhandled executable tool {tool_name!r}")
 
